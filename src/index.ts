@@ -216,17 +216,21 @@ ${optionsList}
 
 Reply with ONLY the raw option ID of your chosen option — no brackets, no explanation, nothing else. Example format: d0c14d45-9cf1-470f-84bb-ea8bccc39a40`;
 
-  while (currentKeyIndex < apiKeys.length) {
-    const activeApiKey = apiKeys[currentKeyIndex];
+  let keyIdx = currentKeyIndex;
+
+  while (keyIdx < apiKeys.length) {
+    const activeApiKey = apiKeys[keyIdx];
     const aiInstance = getGenAIInstance(activeApiKey);
 
-    // Cascade across Models for the active API Key
-    while (currentModelIndex < MODEL_PRIORITY_LIST.length) {
-      const activeModelName = MODEL_PRIORITY_LIST[currentModelIndex];
+    // Per-event model cascade starting from current non-rate-limited model index
+    let modelIdx = keyIdx === currentKeyIndex ? currentModelIndex : 0;
+
+    while (modelIdx < MODEL_PRIORITY_LIST.length) {
+      const activeModelName = MODEL_PRIORITY_LIST[modelIdx];
 
       try {
         console.log(
-          `  [AI] Querying Key #${currentKeyIndex + 1} (${activeApiKey.slice(0, 6)}...) with model "${activeModelName}"`
+          `  [AI] Querying Key #${keyIdx + 1} (${activeApiKey.slice(0, 6)}...) with model "${activeModelName}"`
         );
 
         const modelConfig: any = {
@@ -254,7 +258,7 @@ Reply with ONLY the raw option ID of your chosen option — no brackets, no expl
           },
         };
 
-        // Enforce 15 RPM inter-request delay pacing for non-Gemma models (e.g. gemini-3.6-flash-lite)
+        // Enforce 15 RPM inter-request delay pacing for non-Gemma models
         await ensure15RpmPacing(activeModelName);
 
         const enableInternet = !activeModelName.includes("-lite");
@@ -278,7 +282,7 @@ Reply with ONLY the raw option ID of your chosen option — no brackets, no expl
             );
             if (activeModelName.startsWith("gemma")) {
               throw new Error(
-                `[Internet Notice] "${activeModelName}" search tools failed/timed out (${toolErr.message}). Switching to fallback model.`
+                `[Internet Notice] "${activeModelName}" search tools failed/timed out (${toolErr.message}).`
               );
             }
             console.warn(`  Falling back to basic mode for "${activeModelName}"...`);
@@ -327,30 +331,26 @@ Reply with ONLY the raw option ID of your chosen option — no brackets, no expl
             `  [Rate Limit Backoff] "${activeModelName}" hit rate limit (429). Sleeping 10s before failover...`
           );
           await sleep(10000);
-        }
 
-        currentModelIndex++;
-        if (currentModelIndex < MODEL_PRIORITY_LIST.length) {
-          console.log(
-            `  [Next Model] Advancing to model "${MODEL_PRIORITY_LIST[currentModelIndex]}" for Key #${currentKeyIndex + 1}...`
+          currentModelIndex = modelIdx + 1;
+          if (currentModelIndex >= MODEL_PRIORITY_LIST.length) {
+            currentKeyIndex++;
+            currentModelIndex = 0;
+            keyIdx = currentKeyIndex;
+            modelIdx = 0;
+          } else {
+            modelIdx = currentModelIndex;
+          }
+        } else {
+          console.warn(
+            `  [Event Model Fallback] "${activeModelName}" failed for this event (${err.message}). Trying next model...`
           );
-          await sleep(1000);
+          modelIdx++;
         }
       }
     }
 
-    // All models on current API Key exhausted -> switch to next API Key and reset model index to 0
-    currentKeyIndex++;
-    currentModelIndex = 0;
-
-    if (currentKeyIndex < apiKeys.length) {
-      console.log(
-        `  [Key Switch] All models exhausted for Key #${currentKeyIndex}. Switching to API Key #${currentKeyIndex + 1}!`
-      );
-      await sleep(2000);
-    } else {
-      console.error("  [All Keys Exhausted] All API keys and models exhausted.");
-    }
+    keyIdx++;
   }
 
   return null;
