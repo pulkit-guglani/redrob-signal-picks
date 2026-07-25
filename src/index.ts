@@ -64,6 +64,13 @@ async function refreshAccessToken(): Promise<boolean> {
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+interface UserBalance {
+  availableBalance: number;
+  visual?: {
+    availableBalance?: number;
+  };
+}
+
 interface EventOption {
   id: string;
   optionText: string;
@@ -78,6 +85,15 @@ interface Event {
   closesAt?: string | null;
   options: EventOption[];
   userPick?: unknown | null;
+}
+
+// ─── Fetch Balance ────────────────────────────────────────────────────────────
+
+async function fetchUserBalance(): Promise<number> {
+  const res = await api.get("/v1/users/balance");
+  const payload = res.data?.data ?? res.data;
+  const availableBalance = payload?.visual?.availableBalance ?? payload?.availableBalance ?? 0;
+  return availableBalance;
 }
 
 // ─── Fetch Events ─────────────────────────────────────────────────────────────
@@ -425,42 +441,7 @@ async function placePick(
 async function main() {
   console.log(`\n[${new Date().toISOString()}] Starting auto-pick run...`);
 
-  let events: Event[];
-  try {
-    events = await fetchOpenEvents();
-  } catch (err: any) {
-    console.error("Failed to fetch events:", err.message);
-    process.exit(1);
-  }
-
-  console.log(`Found ${events.length} open event(s) without a pick`);
-
-  for (const event of events) {
-    console.log(`\nProcessing: "${event.title}"`);
-    try {
-      const aiResult = await getAIPick(event);
-      if (!aiResult) {
-        console.log(`  Skipped — AI could not determine an option`);
-      } else {
-        const amount = event.minBetAmount || 10;
-        await placePick(event.id, aiResult.optionId, amount, aiResult.confidence);
-        const optionText = event.options.find((o) => o.id === aiResult.optionId)?.optionText;
-        console.log(
-          `  Picked: "${optionText}" (amount: ${amount}, confidence: ${aiResult.confidence}%, model: ${aiResult.modelUsed})`
-        );
-      }
-    } catch (err: any) {
-      const status = err?.status ?? err?.response?.status;
-      if (status === 429) {
-        console.warn(`  Skipped — Gemini rate limit hit, will retry next run`);
-      } else {
-        console.error(`  Error: ${err.response?.data?.message || err.message}`);
-      }
-    }
-    await sleep(4000); // stay under 15 req/min free tier limit
-  }
-
-  // ── Reveal settled picks ──────────────────────────────────────────────────
+  // ─── 1. Reveal settled picks ───────────────────────────────────────────────
   console.log("\nChecking for unrevealed results...");
   try {
     const unrevealed = await fetchUnrevealedPicks();
@@ -475,6 +456,54 @@ async function main() {
     }
   } catch (err: any) {
     console.error("Failed to fetch unrevealed picks:", err.message);
+  }
+
+  // ─── 2. Check balance & place picks ─────────────────────────────────────────
+  let availableBalance = 0;
+  try {
+    availableBalance = await fetchUserBalance();
+    console.log(`User available balance: ${availableBalance}`);
+  } catch (err: any) {
+    console.error("Failed to fetch user balance:", err.message);
+  }
+
+  if (availableBalance <= 2000) {
+    console.log(`Available balance (${availableBalance}) is <= 2000 — skipping open events check.`);
+  } else {
+    let events: Event[];
+    try {
+      events = await fetchOpenEvents();
+    } catch (err: any) {
+      console.error("Failed to fetch events:", err.message);
+      process.exit(1);
+    }
+
+    console.log(`Found ${events.length} open event(s) without a pick`);
+
+    for (const event of events) {
+      console.log(`\nProcessing: "${event.title}"`);
+      try {
+        const aiResult = await getAIPick(event);
+        if (!aiResult) {
+          console.log(`  Skipped — AI could not determine an option`);
+        } else {
+          const amount = event.minBetAmount || 10;
+          await placePick(event.id, aiResult.optionId, amount, aiResult.confidence);
+          const optionText = event.options.find((o) => o.id === aiResult.optionId)?.optionText;
+          console.log(
+            `  Picked: "${optionText}" (amount: ${amount}, confidence: ${aiResult.confidence}%, model: ${aiResult.modelUsed})`
+          );
+        }
+      } catch (err: any) {
+        const status = err?.status ?? err?.response?.status;
+        if (status === 429) {
+          console.warn(`  Skipped — Gemini rate limit hit, will retry next run`);
+        } else {
+          console.error(`  Error: ${err.response?.data?.message || err.message}`);
+        }
+      }
+      await sleep(4000); // stay under 15 req/min free tier limit
+    }
   }
 
   console.log(`\n[${new Date().toISOString()}] Run complete.`);
