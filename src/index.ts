@@ -1,5 +1,5 @@
 import axios, { AxiosInstance } from "axios";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -8,10 +8,16 @@ const API_BASE_URL =
 
 let accessToken = process.env.ACCESS_TOKEN || "";
 let refreshToken = process.env.REFRESH_TOKEN || "";
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 
-if (!accessToken || !refreshToken || !GEMINI_API_KEY) {
-  console.error("Missing required env vars: ACCESS_TOKEN, REFRESH_TOKEN, GEMINI_API_KEY");
+// Parse multiple API keys (comma-separated GEMINI_API_KEYS or single GEMINI_API_KEY)
+const apiKeys: string[] = process.env.GEMINI_API_KEYS
+  ? process.env.GEMINI_API_KEYS.split(",").map((k) => k.trim()).filter(Boolean)
+  : process.env.GEMINI_API_KEY
+    ? [process.env.GEMINI_API_KEY.trim()]
+    : [];
+
+if (!accessToken || !refreshToken || apiKeys.length === 0) {
+  console.error("Missing required env vars: ACCESS_TOKEN, REFRESH_TOKEN, GEMINI_API_KEYS or GEMINI_API_KEY");
   process.exit(1);
 }
 
@@ -81,7 +87,7 @@ async function fetchOpenEvents(): Promise<Event[]> {
   let cursor: string | null = null;
 
   do {
-    const res = await api.get("/v1/events", {
+    const res: any = await api.get("/v1/events", {
       params: { status: "OPENED", limit: 50, ...(cursor ? { cursor } : {}) },
     });
     const payload = res.data?.data;
@@ -121,12 +127,65 @@ async function fetchOpenEvents(): Promise<Event[]> {
 
 // ─── AI Pick ──────────────────────────────────────────────────────────────────
 
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-3.1-flash-lite" });
+// Model Priority List requested
+const MODEL_PRIORITY_LIST: string[] = [
+  "gemma-4-31b-it",
+  "gemini-3.5-flash-lite",
+  "gemini-3.1-flash-lite",
+];
+
+// Cache GoogleGenerativeAI instances per API Key
+const genAIInstances = new Map<string, GoogleGenerativeAI>();
+function getGenAIInstance(key: string): GoogleGenerativeAI {
+  if (!genAIInstances.has(key)) {
+    genAIInstances.set(key, new GoogleGenerativeAI(key));
+  }
+  return genAIInstances.get(key)!;
+}
+
+// Sticky pointers: current Key index and current Model index
+let currentKeyIndex = 0;
+let currentModelIndex = 0;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function getAIPick(event: Event): Promise<string | null> {
+let last15RpmCallTimestamp = 0;
+
+async function ensure15RpmPacing(modelName: string): Promise<void> {
+  const is15RpmModel = !modelName.startsWith("gemma");
+  if (!is15RpmModel) return;
+
+  const now = Date.now();
+  const elapsed = now - last15RpmCallTimestamp;
+  const MIN_INTERVAL_MS = 4100; // 4.1s safety margin for 15 req/min (60s / 15 = 4s)
+
+  if (elapsed < MIN_INTERVAL_MS && last15RpmCallTimestamp > 0) {
+    const waitMs = MIN_INTERVAL_MS - elapsed;
+    console.log(
+      `  [Rate Limit Pacer] Waiting ${(waitMs / 1000).toFixed(1)}s for "${modelName}" (15 RPM limit)...`
+    );
+    await sleep(waitMs);
+  }
+  last15RpmCallTimestamp = Date.now();
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, errorMessage: string): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const timeoutPromise = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(errorMessage));
+    }, ms);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+}
+
+interface AIPickResult {
+  optionId: string;
+  confidence: number;
+  modelUsed: string;
+}
+
+async function getAIPick(event: Event): Promise<AIPickResult | null> {
   const optionsList = event.options
     .map((o) => `[${o.id}] ${o.optionText}`)
     .join("\n");
@@ -141,15 +200,144 @@ ${optionsList}
 
 Reply with ONLY the raw option ID of your chosen option — no brackets, no explanation, nothing else. Example format: d0c14d45-9cf1-470f-84bb-ea8bccc39a40`;
 
-  const result = await model.generateContent(prompt);
-  const text = result.response.text().trim().replace(/^\[|\]$/g, "");
+  while (currentKeyIndex < apiKeys.length) {
+    const activeApiKey = apiKeys[currentKeyIndex];
+    const aiInstance = getGenAIInstance(activeApiKey);
 
-  const match = event.options.find((o) => o.id === text);
-  if (!match) {
-    console.warn(`  AI returned unrecognized option ID: "${text}"`);
-    return null;
+    // Cascade across Models for the active API Key
+    while (currentModelIndex < MODEL_PRIORITY_LIST.length) {
+      const activeModelName = MODEL_PRIORITY_LIST[currentModelIndex];
+
+      try {
+        console.log(
+          `  [AI] Querying Key #${currentKeyIndex + 1} (${activeApiKey.slice(0, 6)}...) with model "${activeModelName}"`
+        );
+
+        const modelConfig: any = {
+          model: activeModelName,
+          generationConfig: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: SchemaType.OBJECT,
+              properties: {
+                reasoning: {
+                  type: SchemaType.STRING,
+                  description: "Step-by-step comparative evaluation of each option's probability.",
+                },
+                chosenOptionId: {
+                  type: SchemaType.STRING,
+                  description: "The exact ID of the option with the highest winning probability.",
+                },
+                confidence: {
+                  type: SchemaType.NUMBER,
+                  description: "Confidence score percentage (50 to 95) for the chosen option.",
+                },
+              },
+              required: ["reasoning", "chosenOptionId", "confidence"],
+            },
+          },
+        };
+
+        // Enforce 15 RPM inter-request delay pacing for non-Gemma models (e.g. gemini-3.6-flash-lite)
+        await ensure15RpmPacing(activeModelName);
+
+        const enableInternet = !activeModelName.includes("-lite");
+        let result: any;
+
+        if (enableInternet) {
+          try {
+            const modelWithTools = aiInstance.getGenerativeModel({
+              ...modelConfig,
+              tools: [{ googleSearch: {} } as any],
+            });
+            const timeoutMs = activeModelName.startsWith("gemma") ? 12000 : 25000;
+            result = await withTimeout(
+              modelWithTools.generateContent(prompt),
+              timeoutMs,
+              `"${activeModelName}" search query timed out after ${timeoutMs / 1000}s`
+            );
+          } catch (toolErr: any) {
+            console.warn(
+              `  [Internet Notice] "${activeModelName}" search tools failed (${toolErr.message}).`
+            );
+            if (activeModelName.startsWith("gemma")) {
+              throw new Error(
+                `[Internet Notice] "${activeModelName}" search tools failed/timed out (${toolErr.message}). Switching to fallback model.`
+              );
+            }
+            console.warn(`  Falling back to basic mode for "${activeModelName}"...`);
+            const basicModel = aiInstance.getGenerativeModel(modelConfig);
+            result = await withTimeout(
+              basicModel.generateContent(prompt),
+              20000,
+              `"${activeModelName}" basic query timed out after 20s`
+            );
+          }
+        } else {
+          // Lite models run directly in basic mode without internet search tools
+          const basicModel = aiInstance.getGenerativeModel(modelConfig);
+          result = await withTimeout(
+            basicModel.generateContent(prompt),
+            20000,
+            `"${activeModelName}" basic query timed out after 20s`
+          );
+        }
+
+        const responseText = result.response.text();
+        const parsed = JSON.parse(responseText);
+
+        console.log(`  AI Reasoning (${activeModelName}): ${parsed.reasoning}`);
+        const chosenOptionId = parsed.chosenOptionId?.trim();
+        const match = event.options.find((o) => o.id === chosenOptionId);
+
+        const parsedConfidence = Math.min(
+          95,
+          Math.max(50, Math.round(Number(parsed.confidence) || 70))
+        );
+
+        if (match) {
+          return { optionId: match.id, confidence: parsedConfidence, modelUsed: activeModelName };
+        }
+
+        console.warn(`  AI returned unrecognized option ID: "${chosenOptionId}"`);
+      } catch (err: any) {
+        const isRateLimitErr =
+          err.message?.includes("429") ||
+          err.message?.includes("RESOURCE_EXHAUSTED") ||
+          err.message?.toLowerCase().includes("rate limit");
+
+        if (isRateLimitErr) {
+          console.warn(
+            `  [Rate Limit Backoff] "${activeModelName}" hit rate limit (429). Sleeping 10s before failover...`
+          );
+          await sleep(10000);
+        }
+
+        currentModelIndex++;
+        if (currentModelIndex < MODEL_PRIORITY_LIST.length) {
+          console.log(
+            `  [Next Model] Advancing to model "${MODEL_PRIORITY_LIST[currentModelIndex]}" for Key #${currentKeyIndex + 1}...`
+          );
+          await sleep(1000);
+        }
+      }
+    }
+
+    // All models on current API Key exhausted -> switch to next API Key and reset model index to 0
+    currentKeyIndex++;
+    currentModelIndex = 0;
+
+    if (currentKeyIndex < apiKeys.length) {
+      console.log(
+        `  [Key Switch] All models exhausted for Key #${currentKeyIndex}. Switching to API Key #${currentKeyIndex + 1}!`
+      );
+      await sleep(2000);
+    } else {
+      console.error("  [All Keys Exhausted] All API keys and models exhausted.");
+    }
   }
-  return match.id;
+
+  return null;
 }
 
 // ─── Reveal Picks ────────────────────────────────────────────────────────────
@@ -170,7 +358,7 @@ async function fetchUnrevealedPicks(): Promise<Pick[]> {
   const STOP_AFTER_VIEWED = 4;
 
   do {
-    const res = await api.get("/v1/picks", {
+    const res: any = await api.get("/v1/picks", {
       params: {
         status: ["WON", "LOST"],
         sortBy: "revealFirst",
@@ -221,13 +409,14 @@ async function revealPick(pickId: string): Promise<void> {
 async function placePick(
   eventId: string,
   optionId: string,
-  amount: number
+  amount: number,
+  confidence: number = 70
 ): Promise<void> {
   await api.post("/v1/picks", {
     eventId,
     optionId,
     amount,
-    confidence: 70,
+    confidence,
   });
 }
 
@@ -249,14 +438,16 @@ async function main() {
   for (const event of events) {
     console.log(`\nProcessing: "${event.title}"`);
     try {
-      const optionId = await getAIPick(event);
-      if (!optionId) {
+      const aiResult = await getAIPick(event);
+      if (!aiResult) {
         console.log(`  Skipped — AI could not determine an option`);
       } else {
         const amount = event.minBetAmount || 10;
-        await placePick(event.id, optionId, amount);
-        const optionText = event.options.find((o) => o.id === optionId)?.optionText;
-        console.log(`  Picked: "${optionText}" (amount: ${amount}, confidence: 70%)`);
+        await placePick(event.id, aiResult.optionId, amount, aiResult.confidence);
+        const optionText = event.options.find((o) => o.id === aiResult.optionId)?.optionText;
+        console.log(
+          `  Picked: "${optionText}" (amount: ${amount}, confidence: ${aiResult.confidence}%, model: ${aiResult.modelUsed})`
+        );
       }
     } catch (err: any) {
       const status = err?.status ?? err?.response?.status;
