@@ -64,6 +64,13 @@ async function refreshAccessToken(): Promise<boolean> {
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+interface UserBalance {
+  availableBalance: number;
+  visual?: {
+    availableBalance?: number;
+  };
+}
+
 interface EventOption {
   id: string;
   optionText: string;
@@ -78,6 +85,15 @@ interface Event {
   closesAt?: string | null;
   options: EventOption[];
   userPick?: unknown | null;
+}
+
+// ─── Fetch Balance ────────────────────────────────────────────────────────────
+
+async function fetchUserBalance(): Promise<number> {
+  const res = await api.get("/v1/users/balance");
+  const payload = res.data?.data ?? res.data;
+  const availableBalance = payload?.visual?.availableBalance ?? payload?.availableBalance ?? 0;
+  return availableBalance;
 }
 
 // ─── Fetch Events ─────────────────────────────────────────────────────────────
@@ -200,17 +216,21 @@ ${optionsList}
 
 Reply with ONLY the raw option ID of your chosen option — no brackets, no explanation, nothing else. Example format: d0c14d45-9cf1-470f-84bb-ea8bccc39a40`;
 
-  while (currentKeyIndex < apiKeys.length) {
-    const activeApiKey = apiKeys[currentKeyIndex];
+  let keyIdx = currentKeyIndex;
+
+  while (keyIdx < apiKeys.length) {
+    const activeApiKey = apiKeys[keyIdx];
     const aiInstance = getGenAIInstance(activeApiKey);
 
-    // Cascade across Models for the active API Key
-    while (currentModelIndex < MODEL_PRIORITY_LIST.length) {
-      const activeModelName = MODEL_PRIORITY_LIST[currentModelIndex];
+    // Per-event model cascade starting from current non-rate-limited model index
+    let modelIdx = keyIdx === currentKeyIndex ? currentModelIndex : 0;
+
+    while (modelIdx < MODEL_PRIORITY_LIST.length) {
+      const activeModelName = MODEL_PRIORITY_LIST[modelIdx];
 
       try {
         console.log(
-          `  [AI] Querying Key #${currentKeyIndex + 1} (${activeApiKey.slice(0, 6)}...) with model "${activeModelName}"`
+          `  [AI] Querying Key #${keyIdx + 1} (${activeApiKey.slice(0, 6)}...) with model "${activeModelName}"`
         );
 
         const modelConfig: any = {
@@ -238,7 +258,7 @@ Reply with ONLY the raw option ID of your chosen option — no brackets, no expl
           },
         };
 
-        // Enforce 15 RPM inter-request delay pacing for non-Gemma models (e.g. gemini-3.6-flash-lite)
+        // Enforce 15 RPM inter-request delay pacing for non-Gemma models
         await ensure15RpmPacing(activeModelName);
 
         const enableInternet = !activeModelName.includes("-lite");
@@ -262,7 +282,7 @@ Reply with ONLY the raw option ID of your chosen option — no brackets, no expl
             );
             if (activeModelName.startsWith("gemma")) {
               throw new Error(
-                `[Internet Notice] "${activeModelName}" search tools failed/timed out (${toolErr.message}). Switching to fallback model.`
+                `[Internet Notice] "${activeModelName}" search tools failed/timed out (${toolErr.message}).`
               );
             }
             console.warn(`  Falling back to basic mode for "${activeModelName}"...`);
@@ -311,30 +331,26 @@ Reply with ONLY the raw option ID of your chosen option — no brackets, no expl
             `  [Rate Limit Backoff] "${activeModelName}" hit rate limit (429). Sleeping 10s before failover...`
           );
           await sleep(10000);
-        }
 
-        currentModelIndex++;
-        if (currentModelIndex < MODEL_PRIORITY_LIST.length) {
-          console.log(
-            `  [Next Model] Advancing to model "${MODEL_PRIORITY_LIST[currentModelIndex]}" for Key #${currentKeyIndex + 1}...`
+          currentModelIndex = modelIdx + 1;
+          if (currentModelIndex >= MODEL_PRIORITY_LIST.length) {
+            currentKeyIndex++;
+            currentModelIndex = 0;
+            keyIdx = currentKeyIndex;
+            modelIdx = 0;
+          } else {
+            modelIdx = currentModelIndex;
+          }
+        } else {
+          console.warn(
+            `  [Event Model Fallback] "${activeModelName}" failed for this event (${err.message}). Trying next model...`
           );
-          await sleep(1000);
+          modelIdx++;
         }
       }
     }
 
-    // All models on current API Key exhausted -> switch to next API Key and reset model index to 0
-    currentKeyIndex++;
-    currentModelIndex = 0;
-
-    if (currentKeyIndex < apiKeys.length) {
-      console.log(
-        `  [Key Switch] All models exhausted for Key #${currentKeyIndex}. Switching to API Key #${currentKeyIndex + 1}!`
-      );
-      await sleep(2000);
-    } else {
-      console.error("  [All Keys Exhausted] All API keys and models exhausted.");
-    }
+    keyIdx++;
   }
 
   return null;
@@ -425,42 +441,7 @@ async function placePick(
 async function main() {
   console.log(`\n[${new Date().toISOString()}] Starting auto-pick run...`);
 
-  let events: Event[];
-  try {
-    events = await fetchOpenEvents();
-  } catch (err: any) {
-    console.error("Failed to fetch events:", err.message);
-    process.exit(1);
-  }
-
-  console.log(`Found ${events.length} open event(s) without a pick`);
-
-  for (const event of events) {
-    console.log(`\nProcessing: "${event.title}"`);
-    try {
-      const aiResult = await getAIPick(event);
-      if (!aiResult) {
-        console.log(`  Skipped — AI could not determine an option`);
-      } else {
-        const amount = event.minBetAmount || 10;
-        await placePick(event.id, aiResult.optionId, amount, aiResult.confidence);
-        const optionText = event.options.find((o) => o.id === aiResult.optionId)?.optionText;
-        console.log(
-          `  Picked: "${optionText}" (amount: ${amount}, confidence: ${aiResult.confidence}%, model: ${aiResult.modelUsed})`
-        );
-      }
-    } catch (err: any) {
-      const status = err?.status ?? err?.response?.status;
-      if (status === 429) {
-        console.warn(`  Skipped — Gemini rate limit hit, will retry next run`);
-      } else {
-        console.error(`  Error: ${err.response?.data?.message || err.message}`);
-      }
-    }
-    await sleep(4000); // stay under 15 req/min free tier limit
-  }
-
-  // ── Reveal settled picks ──────────────────────────────────────────────────
+  // ─── 1. Reveal settled picks ───────────────────────────────────────────────
   console.log("\nChecking for unrevealed results...");
   try {
     const unrevealed = await fetchUnrevealedPicks();
@@ -475,6 +456,54 @@ async function main() {
     }
   } catch (err: any) {
     console.error("Failed to fetch unrevealed picks:", err.message);
+  }
+
+  // ─── 2. Check balance & place picks ─────────────────────────────────────────
+  let availableBalance = 0;
+  try {
+    availableBalance = await fetchUserBalance();
+    console.log(`User available balance: ${availableBalance}`);
+  } catch (err: any) {
+    console.error("Failed to fetch user balance:", err.message);
+  }
+
+  if (availableBalance <= 2000) {
+    console.log(`Available balance (${availableBalance}) is <= 2000 — skipping open events check.`);
+  } else {
+    let events: Event[];
+    try {
+      events = await fetchOpenEvents();
+    } catch (err: any) {
+      console.error("Failed to fetch events:", err.message);
+      process.exit(1);
+    }
+
+    console.log(`Found ${events.length} open event(s) without a pick`);
+
+    for (const event of events) {
+      console.log(`\nProcessing: "${event.title}"`);
+      try {
+        const aiResult = await getAIPick(event);
+        if (!aiResult) {
+          console.log(`  Skipped — AI could not determine an option`);
+        } else {
+          const amount = event.minBetAmount || 10;
+          await placePick(event.id, aiResult.optionId, amount, aiResult.confidence);
+          const optionText = event.options.find((o) => o.id === aiResult.optionId)?.optionText;
+          console.log(
+            `  Picked: "${optionText}" (amount: ${amount}, confidence: ${aiResult.confidence}%, model: ${aiResult.modelUsed})`
+          );
+        }
+      } catch (err: any) {
+        const status = err?.status ?? err?.response?.status;
+        if (status === 429) {
+          console.warn(`  Skipped — Gemini rate limit hit, will retry next run`);
+        } else {
+          console.error(`  Error: ${err.response?.data?.message || err.message}`);
+        }
+      }
+      await sleep(4000); // stay under 15 req/min free tier limit
+    }
   }
 
   console.log(`\n[${new Date().toISOString()}] Run complete.`);
