@@ -82,6 +82,7 @@ interface Event {
   description?: string | null;
   status: string;
   minBetAmount?: number;
+  maxBetAmount?: number;
   closesAt?: string | null;
   options: EventOption[];
   userPick?: unknown | null;
@@ -487,11 +488,25 @@ async function main() {
         if (!aiResult) {
           console.log(`  Skipped — AI could not determine an option`);
         } else {
-          const amount = event.minBetAmount || 10;
+          const minBetN = event.minBetAmount || 10;
+          const maxBetN = event.maxBetAmount || minBetN;
+          let amount: number;
+          if (availableBalance > 600000 && maxBetN > minBetN) {
+            // Use the quarter-of-max logic when balance > 6 lakh
+            const quickAmounts = (() => {
+              const quarter = Math.round(maxBetN / 4);
+              const half = Math.round(maxBetN / 2);
+              const amounts = [minBetN, quarter, half, maxBetN];
+              return [...new Set(amounts)].sort((a, b) => a - b);
+            })();
+            amount = quickAmounts[1] ?? minBetN; // quarter is always index 1 (after minBet)
+          } else {
+            amount = minBetN;
+          }
           await placePick(event.id, aiResult.optionId, amount, aiResult.confidence);
           const optionText = event.options.find((o) => o.id === aiResult.optionId)?.optionText;
           console.log(
-            `  Picked: "${optionText}" (amount: ${amount}, confidence: ${aiResult.confidence}%, model: ${aiResult.modelUsed})`
+            `  Picked: "${optionText}" (amount: ${amount}, confidence: ${aiResult.confidence}%, model: ${aiResult.modelUsed}, balance: ${availableBalance})`
           );
         }
       } catch (err: any) {
