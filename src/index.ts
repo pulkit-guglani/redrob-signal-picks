@@ -437,10 +437,59 @@ async function placePick(
   });
 }
 
+// ─── Daily Draw ──────────────────────────────────────────────────────────────
+
+interface DrawStatus {
+  canDraw: boolean;
+  nextDrawAt: string;
+}
+
+/**
+ * Checks /v1/draws/status and, if canDraw is true, claims the daily draw
+ * via /v1/draws/daily. Both actions are combined in a single function.
+ */
+async function checkAndClaimDailyDraw(): Promise<void> {
+  console.log("\nChecking daily draw status...");
+  try {
+    const statusRes = await api.get<{ data: DrawStatus }>("/v1/draws/status");
+    const { canDraw, nextDrawAt } = statusRes.data?.data ?? (statusRes.data as any);
+
+    if (!canDraw) {
+      console.log(`  [draw] Cannot draw yet. Next draw at: ${nextDrawAt}`);
+      return;
+    }
+
+    console.log("  [draw] Eligible — claiming daily draw...");
+    const drawRes = await api.post("/v1/draws/daily");
+    console.log(`  [draw] Claimed successfully. Response status: ${drawRes.status}`);
+  } catch (err: any) {
+    console.error("  [draw] Error:", err.response?.data?.message ?? err.message);
+  }
+}
+
+/**
+ * Returns true if the current IST time is between 14:00 and 14:45 (inclusive).
+ */
+function isDailyDrawWindow(): boolean {
+  // IST = UTC+5:30
+  const now = new Date();
+  const istOffset = 5 * 60 + 30; // minutes
+  const utcMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const istMinutes = (utcMinutes + istOffset) % (24 * 60);
+  return istMinutes >= 14 * 60 && istMinutes < 14 * 60 + 45;
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
   console.log(`\n[${new Date().toISOString()}] Starting auto-pick run...`);
+
+  // ─── 0. Daily draw (only between 2:00–2:45 PM IST) ────────────────────────
+  if (isDailyDrawWindow()) {
+    await checkAndClaimDailyDraw();
+  } else {
+    console.log("  [draw] Outside 2:00–2:45 PM IST window — skipping daily draw.");
+  }
 
   // ─── 1. Reveal settled picks ───────────────────────────────────────────────
   console.log("\nChecking for unrevealed results...");
@@ -491,16 +540,14 @@ async function main() {
           const minBetN = event.minBetAmount || 10;
           const maxBetN = event.maxBetAmount || minBetN;
           let amount: number;
-          if (availableBalance > 600000 && maxBetN > minBetN) {
-            // Use the quarter-of-max logic when balance > 6 lakh
-            const quickAmounts = (() => {
-              const quarter = Math.round(maxBetN / 4);
-              const half = Math.round(maxBetN / 2);
-              const amounts = [minBetN, quarter, half, maxBetN];
-              return [...new Set(amounts)].sort((a, b) => a - b);
-            })();
-            amount = quickAmounts[1] ?? minBetN; // quarter is always index 1 (after minBet)
+          if (maxBetN > minBetN && availableBalance >= 1200000) {
+            // Balance >= 12 lakh → half of max
+            amount = Math.round(maxBetN / 2);
+          } else if (maxBetN > minBetN && availableBalance >= 600000) {
+            // Balance >= 6 lakh and < 12 lakh → quarter of max
+            amount = Math.round(maxBetN / 4);
           } else {
+            // Balance < 6 lakh → min bet
             amount = minBetN;
           }
           await placePick(event.id, aiResult.optionId, amount, aiResult.confidence);
