@@ -540,10 +540,10 @@ async function main() {
           const minBetN = event.minBetAmount || 10;
           const maxBetN = event.maxBetAmount || minBetN;
           let amount: number;
-          if (maxBetN > minBetN && availableBalance >= 1200000) {
+          if (maxBetN > minBetN && availableBalance >= 900000) {
             // Balance >= 12 lakh → half of max
             amount = Math.round(maxBetN / 2);
-          } else if (maxBetN > minBetN && availableBalance >= 600000) {
+          } else if (maxBetN > minBetN && availableBalance >= 500000) {
             // Balance >= 6 lakh and < 12 lakh → quarter of max
             amount = Math.round(maxBetN / 4);
           } else {
