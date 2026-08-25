@@ -23,35 +23,38 @@ if (!accessToken || !refreshToken || apiKeys.length === 0) {
 
 // ─── Bet Sizing Configuration ──────────────────────────────────────────────────
 
-// Balance threshold for switching from minimum bet mode to dynamic max/4 bet mode (default: 4 Lakh / 400,000 RP)
-const BALANCE_THRESHOLD = Number(process.env.BALANCE_THRESHOLD) || 400000;
+// Balance threshold for switching from minimum bet mode to dynamic second lowest bet mode (6 Lakh / 600,000 RP)
+const BALANCE_THRESHOLD = 600000;
 
-// Configurable maximum bet amount from env (default: 2000 RP)
-const BET_MAX_AMOUNT = Number(process.env.BET_MAX_AMOUNT || process.env.MAX_BET_AMOUNT) || 2000;
+// Fallback maximum bet amount (2,000 RP)
+const BET_MAX_AMOUNT = 2000;
 
 /**
  * Calculates the bet amount dynamically based on available balance.
- * - If balance < BALANCE_THRESHOLD (e.g. < 400,000 RP): returns minimum required bet for the event.
- * - If balance >= BALANCE_THRESHOLD: calculates second highest allowed value (BET_MAX_AMOUNT / 4),
+ * - If balance < BALANCE_THRESHOLD (< 600,000 RP): returns minimum required bet for the event.
+ * - If balance >= BALANCE_THRESHOLD (>= 600,000 RP): calculates the 2nd lowest tier out of the 4 options
+ *   derived from event maxBetAmount (e.g., 20k max -> options are 2k, 5k, 10k, 20k -> 2nd lowest is 5k = max / 4),
  *   ensuring it is at least the event's minBetAmount.
  */
 export function calculateBetAmount(
   balance: number,
-  minBetAmount: number = 10
+  minBetAmount: number = 10,
+  maxBetAmount?: number
 ): number {
   const minRequired = Math.max(10, minBetAmount);
+  const eventMax = maxBetAmount && maxBetAmount > minRequired ? maxBetAmount : BET_MAX_AMOUNT;
 
   if (balance < BALANCE_THRESHOLD) {
     console.log(
-      `  [Bet Sizing] Balance (${balance.toLocaleString()}) < Threshold (${BALANCE_THRESHOLD.toLocaleString()}) -> Using event minimum bet: ${minRequired} RP`
+      `  [Bet Sizing] Balance (${balance.toLocaleString()}) < Threshold (${BALANCE_THRESHOLD.toLocaleString()}) -> Using event minimum bet: ${minRequired.toLocaleString()} RP`
     );
     return minRequired;
   }
 
-  const secondHighestBet = Math.round(BET_MAX_AMOUNT / 4);
-  const finalBet = Math.max(secondHighestBet, minRequired);
+  const secondLowestBet = Math.round(eventMax / 4);
+  const finalBet = Math.max(secondLowestBet, minRequired);
   console.log(
-    `  [Bet Sizing] Balance (${balance.toLocaleString()}) >= Threshold (${BALANCE_THRESHOLD.toLocaleString()}) -> Env Max: ${BET_MAX_AMOUNT.toLocaleString()} RP | Using 2nd highest value (Max/4): ${finalBet.toLocaleString()} RP (min required: ${minRequired.toLocaleString()} RP)`
+    `  [Bet Sizing] Balance (${balance.toLocaleString()}) >= Threshold (${BALANCE_THRESHOLD.toLocaleString()}) -> Event Max: ${eventMax.toLocaleString()} RP | Using 2nd lowest value (Max/4): ${finalBet.toLocaleString()} RP (min required: ${minRequired.toLocaleString()} RP)`
   );
 
   return finalBet;
@@ -504,7 +507,7 @@ async function checkAndClaimDailyDraw(): Promise<void> {
 }
 
 /**
- * Returns true if the current IST time is between 14:00 and 14:45 (inclusive).
+ * Returns true if the current IST time is between 11:15 AM and 12:00 PM (inclusive).
  */
 function isDailyDrawWindow(): boolean {
   // IST = UTC+5:30
@@ -512,7 +515,7 @@ function isDailyDrawWindow(): boolean {
   const istOffset = 5 * 60 + 30; // minutes
   const utcMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
   const istMinutes = (utcMinutes + istOffset) % (24 * 60);
-  return istMinutes >= 14 * 60 && istMinutes < 14 * 60 + 45;
+  return istMinutes >= 11 * 60 + 15 && istMinutes <= 12 * 60;
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -520,11 +523,11 @@ function isDailyDrawWindow(): boolean {
 async function main() {
   console.log(`\n[${new Date().toISOString()}] Starting auto-pick run...`);
 
-  // ─── 0. Daily draw (only between 2:00–2:45 PM IST) ────────────────────────
+  // ─── 0. Daily draw (only between 11:15 AM – 12:00 PM IST) ─────────────────
   if (isDailyDrawWindow()) {
     await checkAndClaimDailyDraw();
   } else {
-    console.log("  [draw] Outside 2:00–2:45 PM IST window — skipping daily draw.");
+    console.log("  [draw] Outside 11:15 AM – 12:00 PM IST window — skipping daily draw.");
   }
 
   // ─── 1. Reveal settled picks ───────────────────────────────────────────────
@@ -573,7 +576,11 @@ async function main() {
         if (!aiResult) {
           console.log(`  Skipped — AI could not determine an option`);
         } else {
-          const amount = calculateBetAmount(availableBalance, event.minBetAmount || 10);
+          const amount = calculateBetAmount(
+            availableBalance,
+            event.minBetAmount || 10,
+            event.maxBetAmount
+          );
           await placePick(event.id, aiResult.optionId, amount, aiResult.confidence);
           const optionText = event.options.find((o) => o.id === aiResult.optionId)?.optionText;
           console.log(
