@@ -21,42 +21,6 @@ if (!accessToken || !refreshToken || apiKeys.length === 0) {
   process.exit(1);
 }
 
-// ─── Bet Sizing Configuration ──────────────────────────────────────────────────
-
-// Balance threshold for switching from minimum bet mode to dynamic max/4 bet mode (default: 4 Lakh / 400,000 RP)
-const BALANCE_THRESHOLD = Number(process.env.BALANCE_THRESHOLD) || 400000;
-
-// Configurable maximum bet amount from env (default: 2000 RP)
-const BET_MAX_AMOUNT = Number(process.env.BET_MAX_AMOUNT || process.env.MAX_BET_AMOUNT) || 2000;
-
-/**
- * Calculates the bet amount dynamically based on available balance.
- * - If balance < BALANCE_THRESHOLD (e.g. < 400,000 RP): returns minimum required bet for the event.
- * - If balance >= BALANCE_THRESHOLD: calculates second highest allowed value (BET_MAX_AMOUNT / 4),
- *   ensuring it is at least the event's minBetAmount.
- */
-export function calculateBetAmount(
-  balance: number,
-  minBetAmount: number = 10
-): number {
-  const minRequired = Math.max(10, minBetAmount);
-
-  if (balance < BALANCE_THRESHOLD) {
-    console.log(
-      `  [Bet Sizing] Balance (${balance.toLocaleString()}) < Threshold (${BALANCE_THRESHOLD.toLocaleString()}) -> Using event minimum bet: ${minRequired} RP`
-    );
-    return minRequired;
-  }
-
-  const secondHighestBet = Math.round(BET_MAX_AMOUNT / 4);
-  const finalBet = Math.max(secondHighestBet, minRequired);
-  console.log(
-    `  [Bet Sizing] Balance (${balance.toLocaleString()}) >= Threshold (${BALANCE_THRESHOLD.toLocaleString()}) -> Env Max: ${BET_MAX_AMOUNT.toLocaleString()} RP | Using 2nd highest value (Max/4): ${finalBet.toLocaleString()} RP (min required: ${minRequired.toLocaleString()} RP)`
-  );
-
-  return finalBet;
-}
-
 // ─── API Client ───────────────────────────────────────────────────────────────
 
 const api: AxiosInstance = axios.create({ baseURL: API_BASE_URL });
@@ -573,7 +537,19 @@ async function main() {
         if (!aiResult) {
           console.log(`  Skipped — AI could not determine an option`);
         } else {
-          const amount = calculateBetAmount(availableBalance, event.minBetAmount || 10);
+          const minBetN = event.minBetAmount || 10;
+          const maxBetN = event.maxBetAmount || minBetN;
+          let amount: number;
+          if (maxBetN > minBetN && availableBalance >= 1000000) {
+            // Balance >= 12 lakh → half of max
+            amount = Math.round(maxBetN / 2);
+          } else if (maxBetN > minBetN && availableBalance >= 550000) {
+            // Balance >= 6 lakh and < 12 lakh → quarter of max
+            amount = Math.round(maxBetN / 4);
+          } else {
+            // Balance < 6 lakh → min bet
+            amount = minBetN;
+          }
           await placePick(event.id, aiResult.optionId, amount, aiResult.confidence);
           const optionText = event.options.find((o) => o.id === aiResult.optionId)?.optionText;
           console.log(
